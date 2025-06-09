@@ -20,6 +20,7 @@ const node_process_1 = __importDefault(require("node:process"));
 const axios_1 = __importDefault(require("axios"));
 const node_os_1 = require("node:os");
 const ratelimiter_1 = __importDefault(require("./ratelimiter"));
+const redisclient_1 = require("./redisclient");
 const { createServer } = node_http_1.default;
 (0, dotenv_1.config)();
 const numOfCPUs = (0, node_os_1.availableParallelism)();
@@ -46,8 +47,8 @@ else {
             }
             catch (rejRes) {
                 res.statusCode = 429;
-                res.setHeader('Retry-After', String(Math.ceil(rejRes.msBeforeNext / 1000)));
-                return res.end(JSON.stringify({ error: 'Too Many Requests' }));
+                res.setHeader("Retry-After", String(Math.ceil(rejRes.msBeforeNext / 1000)));
+                return res.end(JSON.stringify({ error: "Too Many Requests" }));
             }
             let body = "";
             req.on("data", (chunk) => {
@@ -65,7 +66,7 @@ else {
                     const url = BASE_URL + req.url;
                     const method = req.method;
                     const headers = req.headers;
-                    const data = yield forwardRequest(url, method, body, headers);
+                    const data = yield forwardRequest(url, method, body, headers, req.url);
                     res.setHeader("Content-Type", "application/json");
                     if ((data === null || data === void 0 ? void 0 : data.Message) === "This method is not supported") {
                         res.statusCode = 405;
@@ -78,7 +79,7 @@ else {
                     res.end(JSON.stringify({ error: "Internal Server Error" }));
                 }
             }));
-            req.on('error', (err) => {
+            req.on("error", (err) => {
                 console.error("Request stream error ", err);
                 res.statusCode = 400;
                 res.end(JSON.stringify({ error: "Invalid Stream Request" }));
@@ -88,7 +89,8 @@ else {
             console.error(err);
         }
     }));
-    const forwardRequest = (url, method, body, headers) => __awaiter(void 0, void 0, void 0, function* () {
+    const forwardRequest = (url, method, body, headers, requestUrl) => __awaiter(void 0, void 0, void 0, function* () {
+        var _a;
         try {
             const hopByHopHeaders = [
                 "host",
@@ -107,9 +109,23 @@ else {
                     filteredHeaders[key] = value;
                 }
             }
+            const pathSegments = (requestUrl || "/").split("/").filter(Boolean);
+            const tagName = (_a = pathSegments[0]) !== null && _a !== void 0 ? _a : "General";
+            const cacheTagName = `tag:${tagName}`;
+            console.log('cache tag name ', cacheTagName);
+            const cacheKey = `cache:${method}:${url}`;
             if (method == "GET") {
+                console.log("Cache key ", cacheKey);
+                const cachedData = yield redisclient_1.redisClient.get(cacheKey);
+                if (cachedData) {
+                    console.log("cache hit");
+                    return JSON.parse(cachedData);
+                }
                 const request = yield axios_1.default.get(url, { headers: filteredHeaders });
                 const data = request.data;
+                console.log("cache miss");
+                yield redisclient_1.redisClient.set(cacheKey, JSON.stringify(data), "EX", 60);
+                yield redisclient_1.redisClient.sadd(cacheTagName, cacheKey);
                 return data;
             }
             else if (method == "POST") {
@@ -117,9 +133,11 @@ else {
                 if (body) {
                     parsedBody = JSON.parse(body);
                 }
+                yield redisclient_1.redisClient.del(cacheKey);
                 const request = yield axios_1.default.post(url, parsedBody, {
                     headers: filteredHeaders,
                 });
+                yield invalidateKeys(cacheTagName);
                 const data = request.data;
                 return data;
             }
@@ -132,6 +150,7 @@ else {
                     headers: filteredHeaders,
                 });
                 const data = request.data;
+                yield invalidateKeys(cacheTagName);
                 return data;
             }
             else if (method == "PATCH") {
@@ -139,14 +158,18 @@ else {
                 if (body) {
                     parsedBody = JSON.parse(body);
                 }
+                yield redisclient_1.redisClient.del(cacheKey);
                 const request = yield axios_1.default.patch(url, parsedBody, {
                     headers: filteredHeaders,
                 });
                 const data = request.data;
+                yield invalidateKeys(cacheTagName);
                 return data;
             }
             else if (method == "DELETE") {
                 const request = yield axios_1.default.delete(url, { headers: filteredHeaders });
+                yield redisclient_1.redisClient.del(cacheKey);
+                yield invalidateKeys(cacheTagName);
                 return request.data;
             }
             // console.log("else case");
@@ -161,3 +184,10 @@ else {
         //console.log(`listening on port ${PORT}`);
     });
 }
+const invalidateKeys = (tagName) => __awaiter(void 0, void 0, void 0, function* () {
+    const keys = yield redisclient_1.redisClient.smembers(tagName);
+    if (keys.length) {
+        yield redisclient_1.redisClient.del(...keys);
+    }
+    yield redisclient_1.redisClient.del(tagName);
+});
