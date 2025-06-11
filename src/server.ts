@@ -6,10 +6,12 @@ import axios from "axios";
 import { availableParallelism } from "node:os";
 import rateLimiter from "./ratelimiter";
 import { redisClient } from "./redisclient";
+import { invalidateKeys, normalizeURLAndGenerateHash } from "./utils";
 const { createServer } = http;
 config();
 const numOfCPUs = availableParallelism();
 const PORT = process.env.PORT;
+const MAX_BODY_SIZE = Number(process.env.MAX_BODY_SIZE);
 const BASE_URL: string = process.env.BASE_URL ?? "";
 if (cluster.isPrimary) {
   //console.log(`Primary ${process.pid} is running`);
@@ -39,6 +41,10 @@ if (cluster.isPrimary) {
       }
       let body = "";
       req.on("data", (chunk) => {
+        if (body.length > MAX_BODY_SIZE) {
+          res.statusCode = 413;
+          return res.end("Payload Too Large");
+        }
         try {
           body += chunk;
         } catch (err) {
@@ -53,8 +59,27 @@ if (cluster.isPrimary) {
           const method: string | undefined = req.method;
           const headers = req.headers;
 
-          const data = await forwardRequest(url, method, body, headers,req.url);
+          const data = await forwardRequest(
+            url,
+            method,
+            body,
+            headers,
+            req.url
+          );
           res.setHeader("Content-Type", "application/json");
+          res.setHeader("X-Content-Type-Options", "nosniff");
+          res.setHeader("X-Frame-Options", "DENY");
+          res.setHeader("X-XSS-Protection", "1; mode=block");
+          res.setHeader("Referrer-Policy", "no-referrer");
+          res.setHeader(
+            "Strict-Transport-Security",
+            "max-age=63072000; includeSubDomains; preload"
+          );
+
+          res.setHeader("Content-Security-Policy", "default-src 'self'");
+          res.setHeader("Permissions-Policy", "geolocation=(), microphone=()");
+          res.setHeader("Cross-Origin-Opener-Policy", "same-origin");
+
           if (data?.Message === "This method is not supported") {
             res.statusCode = 405;
           }
@@ -81,7 +106,7 @@ if (cluster.isPrimary) {
     method: string | undefined,
     body: any,
     headers: any,
-    requestUrl:string|undefined
+    requestUrl: string | undefined
   ) => {
     try {
       const hopByHopHeaders = [
@@ -104,24 +129,29 @@ if (cluster.isPrimary) {
       const pathSegments = (requestUrl || "/").split("/").filter(Boolean);
       const tagName = pathSegments[0] ?? "General";
       const cacheTagName = `tag:${tagName}`;
+      const hash = normalizeURLAndGenerateHash(url);
+      // console.log('cache tag name ',cacheTagName);
 
-      console.log('cache tag name ',cacheTagName);
-      
-      const cacheKey = `cache:${method}:${url}`;
+      const cacheKey = `cache:${method}:${hash}`;
       if (method == "GET") {
-        console.log("Cache key ", cacheKey);
+       // console.log("Cache key ", cacheKey);
         const cachedData = await redisClient.get(cacheKey);
         if (cachedData) {
-          console.log("cache hit");
+       //   console.log("cache hit");
 
           return JSON.parse(cachedData);
         }
 
         const request = await axios.get(url, { headers: filteredHeaders });
         const data = request.data;
-        console.log("cache miss");
-        await redisClient.set(cacheKey, JSON.stringify(data), "EX", 60);
-        await redisClient.sadd(cacheTagName,cacheKey)
+      //  console.log("cache miss");
+        await redisClient.set(
+          cacheKey,
+          JSON.stringify(data),
+          "EX",
+          Number(process.env.CACHE_TTL) ?? 60
+        );
+        await redisClient.sadd(cacheTagName, cacheKey);
         return data;
       } else if (method == "POST") {
         let parsedBody = {};
@@ -131,8 +161,8 @@ if (cluster.isPrimary) {
         await redisClient.del(cacheKey);
         const request = await axios.post(url, parsedBody, {
           headers: filteredHeaders,
+          timeout: Number(process.env.UPSTREAM_AXIOS_REQUEST_TTL),
         });
-       
 
         await invalidateKeys(cacheTagName);
         const data = request.data;
@@ -145,9 +175,10 @@ if (cluster.isPrimary) {
 
         const request = await axios.put(url, parsedBody, {
           headers: filteredHeaders,
+          timeout: Number(process.env.UPSTREAM_AXIOS_REQUEST_TTL),
         });
         const data = request.data;
-      
+
         await invalidateKeys(cacheTagName);
         return data;
       } else if (method == "PATCH") {
@@ -158,16 +189,18 @@ if (cluster.isPrimary) {
         await redisClient.del(cacheKey);
         const request = await axios.patch(url, parsedBody, {
           headers: filteredHeaders,
+          timeout: Number(process.env.UPSTREAM_AXIOS_REQUEST_TTL),
         });
         const data = request.data;
-        
 
         await invalidateKeys(cacheTagName);
         return data;
       } else if (method == "DELETE") {
-        const request = await axios.delete(url, { headers: filteredHeaders });
+        const request = await axios.delete(url, {
+          headers: filteredHeaders,
+          timeout: Number(process.env.UPSTREAM_AXIOS_REQUEST_TTL),
+        });
         await redisClient.del(cacheKey);
-       
 
         await invalidateKeys(cacheTagName);
         return request.data;
@@ -185,12 +218,32 @@ if (cluster.isPrimary) {
   server.listen(PORT, () => {
     //console.log(`listening on port ${PORT}`);
   });
+  process.on("SIGINT", async () => {
+    console.log("Received SIGINT Signal.Cleaning up");
+    server.close(() => {
+      console.log("Closing Http Server");
+    });
+    try {
+      await redisClient.quit();
+      console.log("Redis Client Closed");
+    } catch (err) {
+      console.error(err);
+    } finally {
+      process.exit(0);
+    }
+  });
+  process.on("SIGTERM", async () => {
+    console.log("Received SIGTERM Signal.Cleaning up");
+    server.close(() => {
+      console.log("Closing Http Server");
+    });
+    try {
+      await redisClient.quit();
+      console.log("Redis Client Closed");
+    } catch (err) {
+      console.error(err);
+    } finally {
+      process.exit(0);
+    }
+  });
 }
-
-const invalidateKeys = async (tagName: string) => {
-  const keys = await redisClient.smembers(tagName);
-  if (keys.length) {
-    await redisClient.del(...keys);
-  }
-  await redisClient.del(tagName)
-};

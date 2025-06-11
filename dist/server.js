@@ -21,10 +21,12 @@ const axios_1 = __importDefault(require("axios"));
 const node_os_1 = require("node:os");
 const ratelimiter_1 = __importDefault(require("./ratelimiter"));
 const redisclient_1 = require("./redisclient");
+const utils_1 = require("./utils");
 const { createServer } = node_http_1.default;
 (0, dotenv_1.config)();
 const numOfCPUs = (0, node_os_1.availableParallelism)();
 const PORT = node_process_1.default.env.PORT;
+const MAX_BODY_SIZE = Number(node_process_1.default.env.MAX_BODY_SIZE);
 const BASE_URL = (_a = node_process_1.default.env.BASE_URL) !== null && _a !== void 0 ? _a : "";
 if (node_cluster_1.default.isPrimary) {
     //console.log(`Primary ${process.pid} is running`);
@@ -52,6 +54,10 @@ else {
             }
             let body = "";
             req.on("data", (chunk) => {
+                if (body.length > MAX_BODY_SIZE) {
+                    res.statusCode = 413;
+                    return res.end("Payload Too Large");
+                }
                 try {
                     body += chunk;
                 }
@@ -68,6 +74,14 @@ else {
                     const headers = req.headers;
                     const data = yield forwardRequest(url, method, body, headers, req.url);
                     res.setHeader("Content-Type", "application/json");
+                    res.setHeader("X-Content-Type-Options", "nosniff");
+                    res.setHeader("X-Frame-Options", "DENY");
+                    res.setHeader("X-XSS-Protection", "1; mode=block");
+                    res.setHeader("Referrer-Policy", "no-referrer");
+                    res.setHeader("Strict-Transport-Security", "max-age=63072000; includeSubDomains; preload");
+                    res.setHeader("Content-Security-Policy", "default-src 'self'");
+                    res.setHeader("Permissions-Policy", "geolocation=(), microphone=()");
+                    res.setHeader("Cross-Origin-Opener-Policy", "same-origin");
                     if ((data === null || data === void 0 ? void 0 : data.Message) === "This method is not supported") {
                         res.statusCode = 405;
                     }
@@ -90,7 +104,7 @@ else {
         }
     }));
     const forwardRequest = (url, method, body, headers, requestUrl) => __awaiter(void 0, void 0, void 0, function* () {
-        var _a;
+        var _a, _b;
         try {
             const hopByHopHeaders = [
                 "host",
@@ -112,19 +126,20 @@ else {
             const pathSegments = (requestUrl || "/").split("/").filter(Boolean);
             const tagName = (_a = pathSegments[0]) !== null && _a !== void 0 ? _a : "General";
             const cacheTagName = `tag:${tagName}`;
-            console.log('cache tag name ', cacheTagName);
-            const cacheKey = `cache:${method}:${url}`;
+            const hash = (0, utils_1.normalizeURLAndGenerateHash)(url);
+            // console.log('cache tag name ',cacheTagName);
+            const cacheKey = `cache:${method}:${hash}`;
             if (method == "GET") {
-                console.log("Cache key ", cacheKey);
+                // console.log("Cache key ", cacheKey);
                 const cachedData = yield redisclient_1.redisClient.get(cacheKey);
                 if (cachedData) {
-                    console.log("cache hit");
+                    //   console.log("cache hit");
                     return JSON.parse(cachedData);
                 }
                 const request = yield axios_1.default.get(url, { headers: filteredHeaders });
                 const data = request.data;
-                console.log("cache miss");
-                yield redisclient_1.redisClient.set(cacheKey, JSON.stringify(data), "EX", 60);
+                //  console.log("cache miss");
+                yield redisclient_1.redisClient.set(cacheKey, JSON.stringify(data), "EX", (_b = Number(node_process_1.default.env.CACHE_TTL)) !== null && _b !== void 0 ? _b : 60);
                 yield redisclient_1.redisClient.sadd(cacheTagName, cacheKey);
                 return data;
             }
@@ -136,8 +151,9 @@ else {
                 yield redisclient_1.redisClient.del(cacheKey);
                 const request = yield axios_1.default.post(url, parsedBody, {
                     headers: filteredHeaders,
+                    timeout: Number(node_process_1.default.env.UPSTREAM_AXIOS_REQUEST_TTL),
                 });
-                yield invalidateKeys(cacheTagName);
+                yield (0, utils_1.invalidateKeys)(cacheTagName);
                 const data = request.data;
                 return data;
             }
@@ -148,9 +164,10 @@ else {
                 }
                 const request = yield axios_1.default.put(url, parsedBody, {
                     headers: filteredHeaders,
+                    timeout: Number(node_process_1.default.env.UPSTREAM_AXIOS_REQUEST_TTL),
                 });
                 const data = request.data;
-                yield invalidateKeys(cacheTagName);
+                yield (0, utils_1.invalidateKeys)(cacheTagName);
                 return data;
             }
             else if (method == "PATCH") {
@@ -161,15 +178,19 @@ else {
                 yield redisclient_1.redisClient.del(cacheKey);
                 const request = yield axios_1.default.patch(url, parsedBody, {
                     headers: filteredHeaders,
+                    timeout: Number(node_process_1.default.env.UPSTREAM_AXIOS_REQUEST_TTL),
                 });
                 const data = request.data;
-                yield invalidateKeys(cacheTagName);
+                yield (0, utils_1.invalidateKeys)(cacheTagName);
                 return data;
             }
             else if (method == "DELETE") {
-                const request = yield axios_1.default.delete(url, { headers: filteredHeaders });
+                const request = yield axios_1.default.delete(url, {
+                    headers: filteredHeaders,
+                    timeout: Number(node_process_1.default.env.UPSTREAM_AXIOS_REQUEST_TTL),
+                });
                 yield redisclient_1.redisClient.del(cacheKey);
-                yield invalidateKeys(cacheTagName);
+                yield (0, utils_1.invalidateKeys)(cacheTagName);
                 return request.data;
             }
             // console.log("else case");
@@ -183,11 +204,36 @@ else {
     server.listen(PORT, () => {
         //console.log(`listening on port ${PORT}`);
     });
+    node_process_1.default.on("SIGINT", () => __awaiter(void 0, void 0, void 0, function* () {
+        console.log("Received SIGINT Signal.Cleaning up");
+        server.close(() => {
+            console.log("Closing Http Server");
+        });
+        try {
+            yield redisclient_1.redisClient.quit();
+            console.log("Redis Client Closed");
+        }
+        catch (err) {
+            console.error(err);
+        }
+        finally {
+            node_process_1.default.exit(0);
+        }
+    }));
+    node_process_1.default.on("SIGTERM", () => __awaiter(void 0, void 0, void 0, function* () {
+        console.log("Received SIGTERM Signal.Cleaning up");
+        server.close(() => {
+            console.log("Closing Http Server");
+        });
+        try {
+            yield redisclient_1.redisClient.quit();
+            console.log("Redis Client Closed");
+        }
+        catch (err) {
+            console.error(err);
+        }
+        finally {
+            node_process_1.default.exit(0);
+        }
+    }));
 }
-const invalidateKeys = (tagName) => __awaiter(void 0, void 0, void 0, function* () {
-    const keys = yield redisclient_1.redisClient.smembers(tagName);
-    if (keys.length) {
-        yield redisclient_1.redisClient.del(...keys);
-    }
-    yield redisclient_1.redisClient.del(tagName);
-});

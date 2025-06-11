@@ -1,12 +1,5 @@
-import Redis from 'ioredis';
-import { config } from 'dotenv';
 import { RateLimiterRedis } from 'rate-limiter-flexible';
 import { redisClient } from './redisclient';
-
-
-
-
-
 const opts = {
   // Basic options
   storeClient: redisClient,
